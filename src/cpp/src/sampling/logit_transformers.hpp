@@ -546,9 +546,13 @@ class ThinkingBudgetTransform : public IStatefulLogitTransformer {
 public:
     enum State { IDLE, COUNTING, FORCING, DONE };
 
+    // multinomial_path: true when the request samples with do_sample (see
+    // apply() - the FORCING representation differs between the argmax-style
+    // consumers and the weighted-draw consumers).
     ThinkingBudgetTransform(int64_t budget, int64_t start_id, int64_t end_id,
-                            const TokenIds& prompt_ids)
-        : m_budget(budget), m_start_id(start_id), m_end_id(end_id) {
+                            const TokenIds& prompt_ids, bool multinomial_path = false)
+        : m_budget(budget), m_start_id(start_id), m_end_id(end_id),
+          m_multinomial_path(multinomial_path) {
         // Scan prompt_ids in reverse to find the last think-related token.
         // Once found, set initial state and trailing token count, then break.
         //   - start_id → prompt ends with open <think> block → COUNTING
@@ -581,6 +585,21 @@ public:
     void apply(Logits& logits) override {
         if (m_state != FORCING) return;
         if (m_end_id < 0) return;
+
+        if (m_multinomial_path) {
+            // Multinomial sampling draws from m_vector once any filter has
+            // initialized it (and treats values as probabilities everywhere
+            // except the fused defer_expf path), so a -inf mask is not a valid
+            // weight there, and top_k/top_p may already have dropped end_id
+            // from the candidate set entirely. Replace the candidate set with
+            // the single end token instead of masking: weight 1.0 samples it
+            // deterministically on both the probability and the deferred-expf
+            // paths, and reported logprobs stay correct (the full-vocab
+            // logprob path reads the untouched raw logit from m_data).
+            logits.m_vector.assign(1, Token(1.0f, m_end_id));
+            logits.m_size = 1;
+            return;
+        }
 
         const float neg_inf = -std::numeric_limits<float>::infinity();
         if (logits.is_vector_initialized()) {
@@ -651,6 +670,7 @@ private:
     int64_t m_budget;
     int64_t m_start_id;
     int64_t m_end_id;
+    bool m_multinomial_path = false;
     State m_state = IDLE;
     size_t m_count = 0;
 };

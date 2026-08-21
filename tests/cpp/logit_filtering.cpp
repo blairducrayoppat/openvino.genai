@@ -799,6 +799,77 @@ TEST(ThinkingBudgetTransformTest, AcceptTokensBatchWithNaturalCloseBecomesPassth
     EXPECT_FALSE(thinking_transform_is_forcing(transform));
 }
 
+TEST(ThinkingBudgetTransformTest, MultinomialForcingRewritesFilteredVectorToEndToken) {
+    // Simulates the multinomial pipeline after top_k/top_p: m_vector holds a
+    // filtered candidate set (probabilities) that does NOT contain end_id.
+    // On the multinomial path FORCING must replace the candidate set with the
+    // single end token rather than masking, so the weighted draw stays valid.
+    TokenIds prompt{7, THINKING_START_ID};
+    auto transform = ThinkingBudgetTransform(0, THINKING_START_ID, THINKING_END_ID, prompt,
+                                             /*multinomial_path=*/true);
+
+    float data[THINKING_VOCAB_SIZE];
+    std::fill_n(data, THINKING_VOCAB_SIZE, 0.1f);
+    Logits logits(data, THINKING_VOCAB_SIZE);
+    logits.initialize_vector();
+    logits.resize(3);  // top-k style truncation: candidates {0, 1, 2}, no end_id
+
+    transform.apply(logits);
+
+    ASSERT_EQ(logits.m_vector.size(), 1u);
+    EXPECT_EQ(logits.m_vector[0].m_index, THINKING_END_ID);
+    EXPECT_EQ(logits.m_vector[0].m_log_prob, 1.0f);
+    EXPECT_EQ(logits.m_size, 1u);
+}
+
+TEST(ThinkingBudgetTransformTest, MultinomialForcingInitializesVectorWhenAbsent) {
+    // Temperature-only multinomial path: no filter initialized m_vector and
+    // m_data holds probabilities. FORCING must still produce a single
+    // end-token candidate set instead of writing -inf into probabilities.
+    TokenIds prompt{7, THINKING_START_ID};
+    auto transform = ThinkingBudgetTransform(0, THINKING_START_ID, THINKING_END_ID, prompt,
+                                             /*multinomial_path=*/true);
+
+    float data[THINKING_VOCAB_SIZE];
+    std::fill_n(data, THINKING_VOCAB_SIZE, 1.0f / THINKING_VOCAB_SIZE);
+    Logits logits(data, THINKING_VOCAB_SIZE);
+    ASSERT_FALSE(logits.is_vector_initialized());
+
+    transform.apply(logits);
+
+    ASSERT_TRUE(logits.is_vector_initialized());
+    ASSERT_EQ(logits.m_vector.size(), 1u);
+    EXPECT_EQ(logits.m_vector[0].m_index, THINKING_END_ID);
+    EXPECT_EQ(logits.m_size, 1u);
+}
+
+TEST(ThinkingBudgetTransformTest, MultinomialPathIsPassthroughWhenNotForcing) {
+    // Outside FORCING the multinomial flag must change nothing.
+    TokenIds prompt{7, THINKING_START_ID};
+    auto transform = ThinkingBudgetTransform(10, THINKING_START_ID, THINKING_END_ID, prompt,
+                                             /*multinomial_path=*/true);
+
+    float data[THINKING_VOCAB_SIZE];
+    std::fill_n(data, THINKING_VOCAB_SIZE, 0.125f);
+    Logits logits(data, THINKING_VOCAB_SIZE);
+    logits.initialize_vector();
+
+    transform.apply(logits);
+
+    EXPECT_EQ(logits.m_vector.size(), THINKING_VOCAB_SIZE);
+    for (size_t i = 0; i < THINKING_VOCAB_SIZE; ++i) {
+        EXPECT_EQ(logits.m_vector[i].m_log_prob, 0.125f);
+    }
+}
+
+TEST(ThinkingBudgetTransformTest, GreedyPathForcingKeepsDataMasking) {
+    // Default (non-multinomial) construction must keep the existing -inf
+    // m_data masking, which is correct for the argmax and beam consumers.
+    TokenIds prompt{7, THINKING_START_ID};
+    auto transform = ThinkingBudgetTransform(0, THINKING_START_ID, THINKING_END_ID, prompt);
+    EXPECT_TRUE(thinking_transform_is_forcing(transform));
+}
+
 TEST(ThinkingBudgetTransformTest, AcceptTokensViaStatefulInterfacePointer) {
     // The transform is registered through m_stateful_logit_transformers, so the
     // production call site only sees IStatefulLogitTransformer. Exercise that

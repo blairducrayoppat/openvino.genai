@@ -126,7 +126,7 @@ public:
             // feeds it accepted tokens through the generic loop.
             if (start_id >= 0 && end_id >= 0 && budget >= 0) {
                 auto thinking_budget = std::make_shared<LogitTransformers::ThinkingBudgetTransform>(
-                    budget, start_id, end_id, input_ids);
+                    budget, start_id, end_id, input_ids, sampling_params.is_multinomial());
                 m_logit_transformers.push_back(thinking_budget);
                 m_stateful_logit_transformers.emplace_back(thinking_budget);
             }
