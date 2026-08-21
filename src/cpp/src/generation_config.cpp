@@ -318,6 +318,12 @@ void GenerationConfig::validate() const {
             OPENVINO_ASSERT(rc.start_token_id >= 0 && rc.end_token_id >= 0,
                 "reasoning_config.start_token_id and end_token_id must both be set "
                 "when reasoning_config.budget is enabled (>= 0).");
+            // The thinking state machine is tracked once per request, so parallel
+            // return sequences would advance and force it jointly. Reject the
+            // combination until per-sequence state is implemented.
+            OPENVINO_ASSERT(num_return_sequences == 1,
+                "reasoning_config with budget >= 0 currently supports only "
+                "num_return_sequences == 1.");
         }
     }
 
