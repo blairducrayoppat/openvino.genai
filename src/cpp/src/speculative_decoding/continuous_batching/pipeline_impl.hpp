@@ -197,8 +197,17 @@ public:
 protected:
     void finish_request(SequenceGroup::Ptr request);
     void _pull_awaiting_requests() override {};
+    // A KV-only block of this pipeline gets its prefix hash when it is allocated. A rollback of rejected draft
+    // tokens that ends inside a block takes that block's hash away again, and with the publication step off the
+    // block then stays unpublished. The step runs only for an offload store that takes completed blocks, because
+    // it is what hands a block to the store once the forward pass has covered it; it then also publishes a
+    // rolled-back block again once the accepted tokens have completed it.
     bool _can_publish_kv_only_completed_blocks() const override {
-        return false;
+        if (!m_scheduler || m_scheduler->has_linear_attention_cache()) {
+            return false;
+        }
+        const SchedulerConfig& scheduler_config = m_scheduler->get_config();
+        return scheduler_config.use_cache_offload && scheduler_config.cache_offload_config.store_completed_blocks;
     }
     bool eagle_mode_enabled = false;
     bool mtp_mode_enabled = false;
