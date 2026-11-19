@@ -148,6 +148,12 @@ public:
         return false;
     }
 
+    /// Whether blocks may still be in the store when another process opens it, so they must be keyed by an identity that
+    /// is the same in every process. True for a plugin and for the persistent in-tree file store.
+    virtual bool outlives_process() const {
+        return is_plugin_backed();
+    }
+
     /// Whether the store decides by itself which blocks to evict when it is full. The caller then never drops blocks
     /// to make room, and any block it stored earlier may be gone by the time it asks for it again.
     virtual bool evicts_itself() const {

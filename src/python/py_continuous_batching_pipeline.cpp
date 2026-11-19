@@ -130,9 +130,10 @@ auto cache_offload_config_docstring = R"(
         dram_cache_capacity_gb property; the in-tree file store has no DRAM tier and ignores it.
     :type dram_cache_capacity_gb: int
 
-    :param reuse_ssd_cache: whether a store plugin loads the cache that an earlier run left in kv_cache_dir for the same model
-        (True, default) or purges it when opening the store (False). Handed to the plugin as the reuse_ssd_cache
-        property; the in-tree file store ignores it.
+    :param reuse_ssd_cache: whether a persistent store loads the cache that an earlier run left in kv_cache_dir for the
+        same model (True, default) or purges it when opening the store (False). Handed to a store plugin as the
+        reuse_ssd_cache property, and honoured by the in-tree file store when persist_file_store is true; the run-scoped
+        in-tree file store ignores it.
     :type reuse_ssd_cache: bool
 
     :param debug_log_path: directory for the debug logs of a store plugin, handed to it as the debug_log_path property
@@ -176,6 +177,13 @@ auto cache_offload_config_docstring = R"(
         is not done by then is cancelled and counted as a cache miss. Only plugins that advertise asynchronous I/O
         can be timed out. Must be greater than 0.
     :type store_timeout_ms: int
+
+    :param persist_file_store: keep the in-tree file store under kv_cache_dir after the pipeline is destroyed, so that a
+        later process opening the same directory for the same model reuses its blocks without a store plugin. Requires
+        kv_cache_dir. Computes the model identity when the pipeline is built and is not supported together with LoRA
+        adapters. One process at a time uses a store directory; another process opening it meanwhile gets a run-scoped
+        store. A store plugin that loads takes precedence. Defaults to false.
+    :type persist_file_store: bool
 )";
 auto scheduler_config_docstring = R"(
     SchedulerConfig to construct ContinuousBatchingPipeline
@@ -514,7 +522,7 @@ void init_continuous_batching_pipeline(py::module_& m) {
                              const std::string& store_provider_name, bool allow_untrusted_store_plugin,
                              bool store_completed_blocks, const std::map<std::string, std::string>& store_properties,
                              int32_t ssd_cache_capacity_gb, int32_t dram_cache_capacity_gb, bool reuse_ssd_cache,
-                             const std::string& debug_log_path, std::uint32_t store_timeout_ms) {
+                             const std::string& debug_log_path, std::uint32_t store_timeout_ms, bool persist_file_store) {
                 CacheOffloadConfig config;
                 config.kv_cache_dir = kv_cache_dir;
                 config.capacity_bytes = capacity_bytes;
@@ -523,6 +531,7 @@ void init_continuous_batching_pipeline(py::module_& m) {
                 config.reuse_ssd_cache = reuse_ssd_cache;
                 config.debug_log_path = debug_log_path;
                 config.store_timeout_ms = store_timeout_ms;
+                config.persist_file_store = persist_file_store;
                 config.linear_attention_capacity_bytes = linear_attention_capacity_bytes;
                 config.buffer_slots = buffer_slots;
                 config.use_page_cache = use_page_cache;
@@ -546,12 +555,14 @@ void init_continuous_batching_pipeline(py::module_& m) {
                  py::arg("dram_cache_capacity_gb") = 0,
                  py::arg("reuse_ssd_cache") = true,
                  py::arg("debug_log_path") = std::string{},
-                 py::arg("store_timeout_ms") = CacheOffloadConfig::DEFAULT_STORE_TIMEOUT_MS)
+                 py::arg("store_timeout_ms") = CacheOffloadConfig::DEFAULT_STORE_TIMEOUT_MS,
+                 py::arg("persist_file_store") = false)
             .def_readwrite("kv_cache_dir", &CacheOffloadConfig::kv_cache_dir)
             .def_readwrite("capacity_bytes", &CacheOffloadConfig::capacity_bytes)
             .def_readwrite("ssd_cache_capacity_gb", &CacheOffloadConfig::ssd_cache_capacity_gb)
             .def_readwrite("dram_cache_capacity_gb", &CacheOffloadConfig::dram_cache_capacity_gb)
             .def_readwrite("reuse_ssd_cache", &CacheOffloadConfig::reuse_ssd_cache)
+            .def_readwrite("persist_file_store", &CacheOffloadConfig::persist_file_store)
             .def_readwrite("debug_log_path", &CacheOffloadConfig::debug_log_path)
             .def_readwrite("linear_attention_capacity_bytes", &CacheOffloadConfig::linear_attention_capacity_bytes)
             .def_readwrite("buffer_slots", &CacheOffloadConfig::buffer_slots)

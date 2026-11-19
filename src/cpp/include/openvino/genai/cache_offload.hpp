@@ -42,11 +42,21 @@ struct CacheOffloadConfig {
     std::int32_t dram_cache_capacity_gb = 0;
 
     /**
-     * Whether a store plugin loads the cache that an earlier run left in `kv_cache_dir` for the same model (true) or purges
-     * it when opening the store (false). Handed to the plugin as the `reuse_ssd_cache` property; the in-tree file store
-     * lives and dies with the pipeline and ignores it.
+     * Whether a persistent store loads the cache that an earlier run left in `kv_cache_dir` for the same model (true) or
+     * purges it when opening the store (false). Handed to a store plugin as the `reuse_ssd_cache` property, and honoured by
+     * the in-tree file store when `persist_file_store` is true; the run-scoped in-tree file store ignores it.
      */
     bool reuse_ssd_cache = true;
+
+    /**
+     * Keeps the in-tree file store under `kv_cache_dir` after the pipeline is destroyed, so that a later process opening
+     * the same directory for the same model reuses its blocks without a store plugin. Requires `kv_cache_dir` to be set.
+     * Like a persistent plugin, this computes the model identity when the pipeline is built and is not supported together
+     * with LoRA adapters. One process at a time uses a store directory; another process opening it meanwhile gets a
+     * run-scoped store. A store plugin that loads takes precedence. When false (default), the in-tree file store belongs to
+     * one pipeline and is removed with it.
+     */
+    bool persist_file_store = false;
 
     /** Directory for the debug logs of a store plugin, handed to it as the `debug_log_path` property when not empty. */
     std::string debug_log_path;
@@ -116,7 +126,7 @@ struct CacheOffloadConfig {
                store_library_path == other.store_library_path && store_provider_name == other.store_provider_name &&
                allow_untrusted_store_plugin == other.allow_untrusted_store_plugin &&
                store_properties == other.store_properties && store_completed_blocks == other.store_completed_blocks &&
-               store_timeout_ms == other.store_timeout_ms;
+               store_timeout_ms == other.store_timeout_ms && persist_file_store == other.persist_file_store;
     }
 
     std::string to_string() const {
@@ -128,6 +138,7 @@ struct CacheOffloadConfig {
         oss << "    ssd_cache_capacity_gb: " << ssd_cache_capacity_gb << "\n";
         oss << "    dram_cache_capacity_gb: " << dram_cache_capacity_gb << "\n";
         oss << "    reuse_ssd_cache: " << std::boolalpha << reuse_ssd_cache << "\n";
+        oss << "    persist_file_store: " << std::boolalpha << persist_file_store << "\n";
         oss << "    debug_log_path: " << (debug_log_path.empty() ? std::string("<none>") : debug_log_path) << "\n";
         oss << "    linear_attention_capacity_bytes: " << linear_attention_capacity_bytes << "\n";
         oss << "    buffer_slots: " << buffer_slots << "\n";

@@ -129,6 +129,9 @@ struct SchedulerConfig {
                 "SchedulerConfig cache_offload_config must set either capacity_bytes or ssd_cache_capacity_gb, not both");
         OPENVINO_ASSERT(!use_cache_offload || cache_offload_config.store_timeout_ms > 0,
                 "SchedulerConfig cache_offload_config.store_timeout_ms must be greater than 0 when use_cache_offload is enabled");
+        OPENVINO_ASSERT(!use_cache_offload || !cache_offload_config.persist_file_store ||
+                            !cache_offload_config.kv_cache_dir.empty(),
+                "SchedulerConfig cache_offload_config.persist_file_store requires kv_cache_dir to be set");
         OPENVINO_ASSERT(!use_cache_offload || cache_offload_config.capacity_bytes > 0 ||
                             cache_offload_config.ssd_cache_capacity_gb > 0,
                 "SchedulerConfig cache_offload_config.capacity_bytes or ssd_cache_capacity_gb must be greater than 0 when use_cache_offload is enabled");

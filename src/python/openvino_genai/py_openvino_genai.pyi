@@ -1261,9 +1261,10 @@ class CacheOffloadConfig:
             dram_cache_capacity_gb property; the in-tree file store has no DRAM tier and ignores it.
         :type dram_cache_capacity_gb: int
     
-        :param reuse_ssd_cache: whether a store plugin loads the cache that an earlier run left in kv_cache_dir for the same model
-            (True, default) or purges it when opening the store (False). Handed to the plugin as the reuse_ssd_cache
-            property; the in-tree file store ignores it.
+        :param reuse_ssd_cache: whether a persistent store loads the cache that an earlier run left in kv_cache_dir for the
+            same model (True, default) or purges it when opening the store (False). Handed to a store plugin as the
+            reuse_ssd_cache property, and honoured by the in-tree file store when persist_file_store is true; the run-scoped
+            in-tree file store ignores it.
         :type reuse_ssd_cache: bool
     
         :param debug_log_path: directory for the debug logs of a store plugin, handed to it as the debug_log_path property
@@ -1307,10 +1308,18 @@ class CacheOffloadConfig:
             is not done by then is cancelled and counted as a cache miss. Only plugins that advertise asynchronous I/O
             can be timed out. Must be greater than 0.
         :type store_timeout_ms: int
+    
+        :param persist_file_store: keep the in-tree file store under kv_cache_dir after the pipeline is destroyed, so that a
+            later process opening the same directory for the same model reuses its blocks without a store plugin. Requires
+            kv_cache_dir. Computes the model identity when the pipeline is built and is not supported together with LoRA
+            adapters. One process at a time uses a store directory; another process opening it meanwhile gets a run-scoped
+            store. A store plugin that loads takes precedence. Defaults to false.
+        :type persist_file_store: bool
     """
     allow_untrusted_store_plugin: bool
     debug_log_path: str
     kv_cache_dir: str
+    persist_file_store: bool
     reuse_ssd_cache: bool
     store_completed_blocks: bool
     store_library_path: str
@@ -1320,7 +1329,7 @@ class CacheOffloadConfig:
     def __init__(self) -> None:
         ...
     @typing.overload
-    def __init__(self, kv_cache_dir: str = '', capacity_bytes: typing.SupportsInt = 0, buffer_slots: typing.SupportsInt = 2, use_page_cache: bool = True, linear_attention_capacity_bytes: typing.SupportsInt = 0, store_library_path: str = '', store_provider_name: str = '', allow_untrusted_store_plugin: bool = False, store_completed_blocks: bool = False, store_properties: collections.abc.Mapping[str, str] = {}, ssd_cache_capacity_gb: typing.SupportsInt = 0, dram_cache_capacity_gb: typing.SupportsInt = 0, reuse_ssd_cache: bool = True, debug_log_path: str = '', store_timeout_ms: typing.SupportsInt = 10000) -> None:
+    def __init__(self, kv_cache_dir: str = '', capacity_bytes: typing.SupportsInt = 0, buffer_slots: typing.SupportsInt = 2, use_page_cache: bool = True, linear_attention_capacity_bytes: typing.SupportsInt = 0, store_library_path: str = '', store_provider_name: str = '', allow_untrusted_store_plugin: bool = False, store_completed_blocks: bool = False, store_properties: collections.abc.Mapping[str, str] = {}, ssd_cache_capacity_gb: typing.SupportsInt = 0, dram_cache_capacity_gb: typing.SupportsInt = 0, reuse_ssd_cache: bool = True, debug_log_path: str = '', store_timeout_ms: typing.SupportsInt = 10000, persist_file_store: bool = False) -> None:
         ...
     def to_string(self) -> str:
         ...

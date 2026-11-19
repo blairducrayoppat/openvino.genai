@@ -109,7 +109,9 @@ const OvKVCacheStoreProviderDescriptor* find_provider(const OvKVCacheStoreModule
 
 std::unique_ptr<IKVCacheStore> make_default_store(const KVCacheDiskLayout& layout,
                                                   const CacheOffloadConfig& config,
-                                                  const std::string& device) {
+                                                  const std::string& device,
+                                                  const std::string& group) {
+    (void)group;
     auto backend = std::make_unique<KVCacheOffloadManager>(layout, config, device);
     return std::make_unique<FileKVCacheStore>(std::move(backend));
 }
@@ -262,7 +264,7 @@ std::unique_ptr<IKVCacheStore> open_kv_cache_store(const KVCacheDiskLayout& layo
         }
         GENAI_WARN("Falling back to the default file store for group '%s'", group.c_str());
     }
-    return make_default_store(layout, config, device);
+    return make_default_store(layout, config, device, group);
 }
 
 }  // namespace ov::genai

@@ -189,13 +189,15 @@ void ContinuousBatchingPipeline::ContinuousBatchingImpl::initialize_pipeline(std
         normalized_offload_config.ssd_cache_capacity_gb = 0;
     }
 
-    // A store plugin may keep blocks across pipelines, so its namespaces need to tell models apart. The in-tree
-    // file store lives and dies with this pipeline and needs no identity.
+    // A store plugin, or the in-tree file store with persist_file_store, may keep blocks across pipelines, so its
+    // namespaces need to tell models apart. The run-scoped in-tree file store lives and dies with this pipeline and
+    // needs no identity.
     std::string model_identity;
     const auto& offload_config = normalized_config.cache_offload_config;
     const bool plugin_backed_offload_requested = normalized_config.use_cache_offload &&
-                                                 offload_config.allow_untrusted_store_plugin &&
-                                                 !offload_config.store_library_path.empty();
+                                                 ((offload_config.allow_untrusted_store_plugin &&
+                                                   !offload_config.store_library_path.empty()) ||
+                                                  offload_config.persist_file_store);
 
     // Resolve per-role MODEL_PROPERTIES overlay for the language model and
     // strip the GenAI-only MODEL_PROPERTIES meta key before reaching the OV plugin.
@@ -209,9 +211,10 @@ void ContinuousBatchingPipeline::ContinuousBatchingImpl::initialize_pipeline(std
     // none), silently reusing KV blocks computed under the wrong weights. Until adapters are folded into cache
     // identity, reject the combination instead of risking that.
     OPENVINO_ASSERT(!plugin_backed_offload_requested || !m_generation_config.adapters,
-                    "KV cache offload through a store plugin is not supported together with LoRA adapters yet, "
-                    "since the store namespace does not distinguish adapters from the base model. Remove "
-                    "allow_untrusted_store_plugin/store_library_path or the adapters to proceed.");
+                    "KV cache offload to a persistent store (a store plugin or persist_file_store) is not supported "
+                    "together with LoRA adapters yet, since the store namespace does not distinguish adapters from the "
+                    "base model. Remove allow_untrusted_store_plugin/store_library_path and persist_file_store, or the "
+                    "adapters, to proceed.");
 
     if (plugin_backed_offload_requested) {
         const auto identity_start = std::chrono::steady_clock::now();
