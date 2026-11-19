@@ -8,7 +8,23 @@
 #include "openvino/genai/speculative_decoding/perf_metrics.hpp"
 #include "speculative_decoding/continuous_batching/mtp_strategy.hpp"
 #include "speculative_decoding/continuous_batching/pipeline_impl.hpp"
+#include "scheduler_test_utils.hpp"
 #include "utils.hpp"
+
+namespace {
+
+// Sits where the offload store sits: it is handed the blocks a forward pass has completed.
+struct CompletedBlocksRecorder : ov::genai::IOverwrittenBlockObserver {
+    std::vector<size_t> hashes;
+
+    void on_blocks_overwritten(size_t, const ov::genai::BlocksPerLayer&) override {}
+
+    void on_blocks_published(size_t hash, const ov::genai::BlocksPerLayer&) override {
+        hashes.push_back(hash);
+    }
+};
+
+}  // namespace
 
 class CBForSDTest : public testing::Test, public ov::genai::ContinuousBatchingPipeline {
 protected:
@@ -56,6 +72,47 @@ protected:
             return _can_publish_kv_only_completed_blocks();
         }
 
+        void set_scheduler(std::shared_ptr<ov::genai::CacheOrchestrator> cache_orchestrator,
+                           const ov::genai::SchedulerConfig& scheduler_config) {
+            m_scheduler = std::make_shared<ov::genai::ContinuousBatchingScheduler>(cache_orchestrator, scheduler_config);
+        }
+
+        // Schedules a new request (the prompt and, if given, draft candidates to validate), stands in for its forward
+        // pass, optionally removes the last generated tokens the way a stop string does, and runs the publication step
+        // of the pipeline. Returns the prefix hashes of the blocks an observer of the KV block manager was handed.
+        std::vector<size_t> hashes_handed_over_after_one_step(const ov::genai::SchedulerConfig& scheduler_config,
+                                                              bool is_validation_mode_enabled,
+                                                              std::vector<int64_t> prompt,
+                                                              const std::vector<int64_t>& candidates = {},
+                                                              size_t tokens_trimmed_after_forward = 0) {
+            m_is_validation_mode_enabled = is_validation_mode_enabled;
+            auto cache_orchestrator = init_cache_orchestrator(scheduler_config);
+            set_scheduler(cache_orchestrator, scheduler_config);
+            CompletedBlocksRecorder recorder;
+            auto& block_manager = cache_orchestrator->get_block_manager(ov::genai::CacheType::KV_CACHE);
+            block_manager.set_overwritten_block_observer(&recorder);
+
+            auto sampling_params = ov::genai::utils::get_greedy_config();
+            sampling_params.num_assistant_tokens = 1;
+            m_requests.push_back(std::make_shared<ov::genai::SequenceGroup>(
+                /*request_id=*/0, ov::Tensor(ov::element::i64, {prompt.size()}, prompt.data()), sampling_params));
+            const auto sequence = m_requests.front()->get_sequences().front();
+            for (const int64_t candidate : candidates) {
+                sequence->append_token(candidate, 0.0f);
+            }
+            m_requests.front()->set_num_validated_tokens(candidates.size());
+            const auto scheduler_output = m_scheduler->schedule(m_requests);
+            OPENVINO_ASSERT(m_requests.front()->get_num_scheduled_tokens() == prompt.size() + candidates.size(),
+                            "The test expects the prompt and every candidate in one step");
+            m_requests.front()->finish_iteration();
+            sequence->remove_last_tokens(static_cast<int>(tokens_trimmed_after_forward));
+            _publish_completed_cache_blocks(scheduler_output);
+
+            block_manager.set_overwritten_block_observer(nullptr);
+            m_scheduler->free_sequence(sequence->get_id());
+            m_requests.clear();
+            return recorder.hashes;
+        }
     };
 
     class MtpPipelineTestInstance : public ContinuousBatchingPipeline::MtpDecodingImpl {
@@ -96,6 +153,61 @@ TEST(SDPerModelsPerfMetrics, DraftOverheadDiagnosticsReturnNanWithoutDenominator
 
 TEST_F(CBForSDTest, DraftPipelineKeepsKvOnlyCompletedBlocksUnpublished) {
     EXPECT_FALSE(m_pipeline.can_publish_kv_only_completed_blocks());
+}
+
+// The publication step of a fast-draft pipeline is off by default. It has to run for an offload store that takes
+// completed blocks, because it is what hands a block over once the forward pass has covered it; without that neither
+// the main model's pipeline (validation mode) nor the draft model's stores anything.
+TEST_F(CBForSDTest, FastDraftPipelineHandsCompletedBlocksToAStoreThatTakesThem) {
+    const std::vector<int64_t> prompt = {0, 1, 2, 3, 4, 5, 6, 7, 8};  // two full blocks and one token of a third
+    for (const bool is_validation_mode_enabled : {true, false}) {
+        SCOPED_TRACE(is_validation_mode_enabled ? "main model pipeline" : "draft model pipeline");
+        ov::genai::SchedulerConfig scheduler_config;
+        scheduler_config.num_kv_blocks = 8;
+        scheduler_config.enable_prefix_caching = true;
+        EXPECT_TRUE(m_pipeline.hashes_handed_over_after_one_step(scheduler_config, is_validation_mode_enabled, prompt).empty())
+            << "no offload store";
+
+        scheduler_config.use_cache_offload = true;
+        EXPECT_TRUE(m_pipeline.hashes_handed_over_after_one_step(scheduler_config, is_validation_mode_enabled, prompt).empty())
+            << "a store without store_completed_blocks takes blocks only when they are overwritten";
+
+        scheduler_config.cache_offload_config.store_completed_blocks = true;
+        EXPECT_EQ(m_pipeline.hashes_handed_over_after_one_step(scheduler_config, is_validation_mode_enabled, prompt).size(), 2u)
+            << "both blocks the prompt completed must be handed to the store";
+    }
+}
+
+// A stop string removes generated tokens after the forward pass that processed them, so the processed count the
+// publication step sees is past the tokens the sequence still holds. The step must hand over the blocks those
+// tokens still fill and leave the rest alone.
+TEST_F(CBForSDTest, FastDraftPipelineHandsOverOnlyBlocksTheSequenceStillHoldsAfterAStopStringTrim) {
+    ov::genai::SchedulerConfig scheduler_config;
+    scheduler_config.num_kv_blocks = 8;
+    scheduler_config.enable_prefix_caching = true;
+    scheduler_config.use_cache_offload = true;
+    scheduler_config.cache_offload_config.store_completed_blocks = true;
+    std::vector<size_t> hashes;
+    EXPECT_NO_THROW(hashes = m_pipeline.hashes_handed_over_after_one_step(scheduler_config,
+                                                                          /*is_validation_mode_enabled=*/true,
+                                                                          /*prompt=*/{0, 1, 2, 3},
+                                                                          /*candidates=*/{4, 5, 6, 7},
+                                                                          /*tokens_trimmed_after_forward=*/4));
+    EXPECT_EQ(hashes.size(), 1u) << "only the prompt block is still described by the tokens of the sequence";
+}
+
+// A pipeline with linear-attention state takes the other branch of the publication step; the switch for KV-only
+// sequences stays off for it whatever the store settings are.
+TEST_F(CBForSDTest, FastDraftPipelineWithLinearAttentionStateKeepsKvOnlyPublicationOff) {
+    ov::genai::SchedulerConfig scheduler_config;
+    scheduler_config.num_kv_blocks = 8;
+    scheduler_config.enable_prefix_caching = true;
+    scheduler_config.use_cache_offload = true;
+    scheduler_config.cache_offload_config.store_completed_blocks = true;
+    m_pipeline.set_scheduler(init_hybrid_cache_orchestrator(scheduler_config), scheduler_config);
+    EXPECT_FALSE(m_pipeline.can_publish_kv_only_completed_blocks());
+    m_pipeline.set_scheduler(init_cache_orchestrator(scheduler_config), scheduler_config);
+    EXPECT_TRUE(m_pipeline.can_publish_kv_only_completed_blocks());
 }
 
 TEST_F(CBForSDTest, MtpDraftConfigWithoutTokenLimitIgnoresEos) {

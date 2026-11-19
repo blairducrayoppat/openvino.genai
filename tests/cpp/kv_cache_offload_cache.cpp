@@ -279,6 +279,70 @@ TEST(TestKVCacheOffloadCache, BlockManagerStoresCompletedBlocksWithoutAnyEvictio
     block_manager.free_sequence(sequence->get_id());
 }
 
+// Speculative decoding on a draft model: a block is completed by candidates and stored, the candidates are rejected
+// by a rollback that ends inside the block, and the block is completed again by the accepted tokens. The store must
+// then hold two entries: the bytes the block had with the candidates under the hash of the candidates, and the bytes
+// it has with the accepted tokens under the hash of the accepted tokens.
+TEST(TestKVCacheOffloadCache, BlockRewrittenAfterARollbackIsStoredUnderTheHashOfItsNewTokens) {
+    constexpr size_t block_size = 4;
+    CacheFixture fixture(/*num_blocks=*/4);
+    auto offload_cache = make_offload_cache(fixture, 4);
+    offload_cache->set_store_completed_blocks(true);
+
+    BlockManager block_manager(/*num_blocks=*/4, /*enable_prefix_caching=*/true, block_size, /*num_layers=*/1);
+    block_manager.set_overwritten_block_observer(offload_cache.get());
+
+    const std::vector<int64_t> prompt = {0, 1, 2, 3};
+    auto group = make_group(prompt, /*request_id=*/1);
+    const auto sequence = group->get_running_sequences().at(0);
+    const auto forward = [&](size_t num_tokens) {
+        group->schedule_tokens(num_tokens);
+        block_manager.append_slots(group);
+        group->finish_iteration();
+    };
+    forward(4);
+    block_manager.publish_completed_blocks(sequence, 0, 4);
+
+    // Candidates 4..7 are forwarded: the forward pass leaves `candidate_bytes` in the second block. The candidate
+    // sampled last, 8, is not forwarded yet.
+    for (const int64_t token : std::vector<int64_t>{4, 5, 6, 7}) {
+        sequence->append_token(token, 0.0f);
+    }
+    forward(4);
+    const size_t second_block = static_cast<size_t>(block_manager.get_block_table(sequence->get_id(), 0).at(1)->get_index());
+    const auto candidate_bytes = fixture.fill_block(second_block, /*seed=*/50);
+    block_manager.publish_completed_blocks(sequence, 4, 8);
+    const size_t candidate_hash = sequence->get_hash(8, block_size);
+    sequence->append_token(8, 0.0f);
+
+    // 6..8 are rejected and replaced; the forward passes of the accepted tokens leave `accepted_bytes` in the block.
+    sequence->remove_last_tokens(3);
+    sequence->append_token(40, 0.0f);
+    group->update_processed_tokens_num(6);
+    block_manager.free_empty_physical_blocks(group);
+    sequence->append_token(41, 0.0f);
+    sequence->append_token(42, 0.0f);
+    forward(2);
+    ASSERT_EQ(static_cast<size_t>(block_manager.get_block_table(sequence->get_id(), 0).at(1)->get_index()), second_block);
+    const auto accepted_bytes = fixture.fill_block(second_block, /*seed=*/90);
+    block_manager.publish_completed_blocks(sequence, 6, 8);
+    const size_t accepted_hash = sequence->get_hash(8, block_size);
+    offload_cache->flush();
+
+    ASSERT_NE(accepted_hash, candidate_hash);
+    ASSERT_NE(accepted_bytes, candidate_bytes);
+    std::vector<uint8_t> stored;
+    ASSERT_TRUE(offload_cache->read(accepted_hash, stored)) << "the rewritten block was not stored";
+    EXPECT_EQ(stored, accepted_bytes);
+    EXPECT_NE(stored, candidate_bytes) << "the bytes of the rejected tokens are stored under the hash of the accepted ones";
+    ASSERT_TRUE(offload_cache->read(candidate_hash, stored));
+    EXPECT_EQ(stored, candidate_bytes) << "the entry of the rejected chain must keep the bytes it was stored with";
+    EXPECT_EQ(offload_cache->get_num_entries(), 3u) << "the prompt block and the two versions of the second block";
+
+    block_manager.set_overwritten_block_observer(nullptr);
+    block_manager.free_sequence(sequence->get_id());
+}
+
 TEST(TestKVCacheOffloadCache, DetachedObserverStopsStoring) {
     constexpr size_t block_size = 4;
     CacheFixture fixture(/*num_blocks=*/2);

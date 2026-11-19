@@ -914,6 +914,247 @@ TEST(TestBlockManager, PublishingCompletedBlocksIgnoresPublishedBlocksPastATrimm
     block_manager.free_sequence(sequence->get_id());
 }
 
+namespace {
+
+// Sits where the offload store sits: it is handed every block the publication step reports as completed.
+struct PublishedBlocksRecorder : ov::genai::IOverwrittenBlockObserver {
+    std::vector<size_t> published_hashes;
+    std::vector<int> published_block_indices;
+
+    void on_blocks_overwritten(size_t, const ov::genai::BlocksPerLayer&) override {}
+
+    void on_blocks_published(size_t hash, const ov::genai::BlocksPerLayer& blocks) override {
+        published_hashes.push_back(hash);
+        published_block_indices.push_back(blocks.front()->get_index());
+    }
+};
+
+// One forward pass over the next `num_tokens` positions of the group.
+void forward(ov::genai::BlockManager& block_manager, const ov::genai::SequenceGroup::Ptr& group, size_t num_tokens) {
+    group->schedule_tokens(num_tokens);
+    block_manager.append_slots(group);
+    group->finish_iteration();
+}
+
+void append_tokens(const ov::genai::Sequence::Ptr& sequence, const std::vector<int64_t>& tokens) {
+    for (const int64_t token : tokens) {
+        sequence->append_token(token, 0.0f);
+    }
+}
+
+// Number of prompt tokens a new request with `tokens` gets from the in-memory prefix cache.
+size_t restored_prefix_length(ov::genai::BlockManager& block_manager, const std::vector<int64_t>& tokens, uint64_t request_id) {
+    auto group = create_sequence_group(tokens, request_id);
+    block_manager.restore_cached_blocks(group);
+    const size_t restored = group->get_num_processed_tokens();
+    const auto seq_id = group->get_running_sequences().front()->get_id();
+    if (block_manager.has_block_table(seq_id)) {
+        block_manager.free_sequence(seq_id);
+    }
+    return restored;
+}
+
+}  // namespace
+
+// Main model order under speculative decoding: the candidates are forwarded, the sampler removes the rejected ones
+// and puts its own token in their place, and the step is published right after. The block the candidates completed
+// still carries the hash of the rejected tokens at that moment; it must not be handed to an observer (the offload
+// store) under that hash. The next scheduling takes the hash away, and the block is handed over once the accepted
+// tokens have been forwarded.
+TEST(TestBlockManager, PublishingCompletedBlocksAfterCandidateRollbackNotifiesOnlyAcceptedContent) {
+    constexpr size_t block_size = 4;
+    ov::genai::BlockManager block_manager(8, true, block_size);
+    PublishedBlocksRecorder recorder;
+    block_manager.set_overwritten_block_observer(&recorder);
+
+    auto sequence_group = create_sequence_group(std::vector<int64_t>{0, 1, 2, 3}, 70);
+    const auto sequence = sequence_group->get_running_sequences().front();
+    forward(block_manager, sequence_group, 4);
+    block_manager.publish_completed_blocks(sequence, 0, 4);
+    const size_t prompt_block_hash = sequence->get_hash(4, block_size);
+    ASSERT_EQ(recorder.published_hashes, std::vector<size_t>{prompt_block_hash});
+
+    // Five candidates are forwarded; they complete the second block and start a third.
+    append_tokens(sequence, {4, 5, 6, 7, 8});
+    const size_t rejected_block_hash = sequence->get_hash(8, block_size);
+    forward(block_manager, sequence_group, 5);
+
+    // Validation keeps 4, 5, 6 and replaces 7: the last position of the second block is stale until 70 is forwarded.
+    sequence->remove_last_tokens(2);
+    sequence->append_token(70, 0.0f);
+    sequence_group->update_processed_tokens_num(7);
+    const auto& second_block = block_manager.get_block_table(sequence->get_id(), 0).at(1);
+    ASSERT_TRUE(second_block->has_published_hash());
+    ASSERT_EQ(second_block->get_hash(), rejected_block_hash) << "the block keeps the hash of the candidates until the next scheduling";
+
+    // The publication of this step ends at the processed count, inside the second block. Even a publication that
+    // reached the end of the block must hand nothing over: its hash is not the hash of the tokens the sequence holds.
+    block_manager.publish_completed_blocks(sequence, 4, 7);
+    block_manager.publish_completed_blocks(sequence, 4, 8);
+    EXPECT_EQ(recorder.published_hashes.size(), 1u) << "a block with a rejected position was handed to the observer";
+
+    // The next scheduling releases the third block and takes the stale hash away.
+    block_manager.free_empty_physical_blocks(sequence_group);
+    ASSERT_FALSE(second_block->has_published_hash());
+
+    forward(block_manager, sequence_group, 1);
+    block_manager.publish_completed_blocks(sequence, 7, 8);
+    const size_t accepted_block_hash = sequence->get_hash(8, block_size);
+    ASSERT_NE(accepted_block_hash, rejected_block_hash);
+    EXPECT_EQ(recorder.published_hashes, (std::vector<size_t>{prompt_block_hash, accepted_block_hash}));
+
+    block_manager.set_overwritten_block_observer(nullptr);
+    block_manager.free_sequence(sequence->get_id());
+}
+
+// Draft model order: the draft publishes after each of its own steps, before the main model's verdict, so a block
+// completed by candidates is handed over under the hash of those candidates. The verdict then rolls the sequence
+// back into the middle of that block, which takes the block's hash away. When the accepted tokens complete the
+// block it is published again and handed over a second time, under the hash of the accepted tokens.
+TEST(TestBlockManager, PublishingBeforeAndAfterARollbackInsideABlockHandsOverBothTokenChains) {
+    constexpr size_t block_size = 4;
+    ov::genai::BlockManager block_manager(8, true, block_size);
+    PublishedBlocksRecorder recorder;
+    block_manager.set_overwritten_block_observer(&recorder);
+
+    auto sequence_group = create_sequence_group(std::vector<int64_t>{0, 1, 2, 3}, 71);
+    const auto sequence = sequence_group->get_running_sequences().front();
+    forward(block_manager, sequence_group, 4);
+    block_manager.publish_completed_blocks(sequence, 0, 4);
+
+    // The draft forwards candidates 4..7, publishes, and holds the candidate it sampled last, 8, unforwarded.
+    append_tokens(sequence, {4, 5, 6, 7});
+    forward(block_manager, sequence_group, 4);
+    block_manager.publish_completed_blocks(sequence, 4, 8);
+    append_tokens(sequence, {8});
+    const size_t rejected_block_hash = sequence->get_hash(8, block_size);
+    ASSERT_EQ(recorder.published_hashes.size(), 2u);
+    EXPECT_EQ(recorder.published_hashes.back(), rejected_block_hash);
+    const int second_block_index = block_manager.get_block_table(sequence->get_id(), 0).at(1)->get_index();
+    EXPECT_EQ(recorder.published_block_indices.back(), second_block_index);
+
+    // Verdict: 4 and 5 stay, 6..8 are removed, the main model's token 40 follows. The sequence then holds 7 tokens, 6 of them processed.
+    sequence->remove_last_tokens(3);
+    sequence->append_token(40, 0.0f);
+    sequence_group->update_processed_tokens_num(6);
+    block_manager.free_empty_physical_blocks(sequence_group);
+    const auto& second_block = block_manager.get_block_table(sequence->get_id(), 0).at(1);
+    ASSERT_EQ(second_block->get_index(), second_block_index);
+    ASSERT_FALSE(second_block->has_published_hash()) << "a rollback inside a block must leave it without a prefix hash";
+    EXPECT_EQ(restored_prefix_length(block_manager, {0, 1, 2, 3, 4, 5, 6, 7, 9}, 72), 4u)
+        << "the rejected token chain must not be restorable from the block that is being rewritten";
+
+    // The next draft steps forward 40 and 41 and complete the block with the accepted tokens.
+    append_tokens(sequence, {41, 42});
+    forward(block_manager, sequence_group, 2);
+    block_manager.publish_completed_blocks(sequence, 6, 8);
+    const size_t accepted_block_hash = sequence->get_hash(8, block_size);
+    ASSERT_NE(accepted_block_hash, rejected_block_hash);
+    ASSERT_EQ(recorder.published_hashes.size(), 3u) << "the refilled block must be handed over a second time";
+    EXPECT_EQ(recorder.published_hashes.back(), accepted_block_hash);
+    EXPECT_EQ(recorder.published_block_indices.back(), second_block_index) << "the same physical block, rewritten";
+    ASSERT_TRUE(second_block->has_published_hash());
+    EXPECT_EQ(second_block->get_hash(), accepted_block_hash);
+
+    // In memory the block is now reusable for the accepted tokens and for nothing else.
+    EXPECT_EQ(restored_prefix_length(block_manager, {0, 1, 2, 3, 4, 5, 40, 41, 9}, 73), 8u);
+    EXPECT_EQ(restored_prefix_length(block_manager, {0, 1, 2, 3, 4, 5, 6, 7, 9}, 74), 4u);
+
+    block_manager.set_overwritten_block_observer(nullptr);
+    block_manager.free_sequence(sequence->get_id());
+}
+
+// Draft model order, rollback to a block boundary: every position of the block the candidates completed is
+// accepted, so the block keeps its hash, stays reusable and is not handed over a second time; the block the
+// rejected candidates had started is released.
+TEST(TestBlockManager, PublishingBeforeAndAfterARollbackToABlockBoundaryKeepsTheCompletedBlock) {
+    constexpr size_t block_size = 4;
+    ov::genai::BlockManager block_manager(8, true, block_size);
+    PublishedBlocksRecorder recorder;
+    block_manager.set_overwritten_block_observer(&recorder);
+
+    auto sequence_group = create_sequence_group(std::vector<int64_t>{0, 1, 2, 3}, 75);
+    const auto sequence = sequence_group->get_running_sequences().front();
+    forward(block_manager, sequence_group, 4);
+    block_manager.publish_completed_blocks(sequence, 0, 4);
+
+    // The draft forwards candidates 4..8, publishes, and holds the candidate it sampled last, 9, unforwarded.
+    append_tokens(sequence, {4, 5, 6, 7, 8});
+    forward(block_manager, sequence_group, 5);
+    block_manager.publish_completed_blocks(sequence, 4, 9);
+    append_tokens(sequence, {9});
+    const size_t second_block_hash = sequence->get_hash(8, block_size);
+    ASSERT_EQ(recorder.published_hashes, (std::vector<size_t>{sequence->get_hash(4, block_size), second_block_hash}));
+
+    // Verdict: 4..7 stay, 8 and 9 are removed, the main model's token 80 follows. Processed 8, a block boundary.
+    sequence->remove_last_tokens(2);
+    sequence->append_token(80, 0.0f);
+    sequence_group->update_processed_tokens_num(8);
+    block_manager.free_empty_physical_blocks(sequence_group);
+    const auto& block_table = block_manager.get_block_table(sequence->get_id(), 0);
+    ASSERT_EQ(block_table.size(), 2u) << "the block the rejected candidates had started is released";
+    ASSERT_TRUE(block_table.at(1)->has_published_hash());
+    EXPECT_EQ(block_table.at(1)->get_hash(), second_block_hash);
+    EXPECT_EQ(sequence->get_hash(8, block_size), second_block_hash) << "the accepted tokens are the ones the block was hashed for";
+
+    // The accepted tokens fill a third block; only that block is handed over.
+    append_tokens(sequence, {81, 82, 83, 84});
+    forward(block_manager, sequence_group, 4);
+    block_manager.publish_completed_blocks(sequence, 8, 12);
+    ASSERT_EQ(recorder.published_hashes.size(), 3u);
+    EXPECT_EQ(recorder.published_hashes.back(), sequence->get_hash(12, block_size));
+    EXPECT_EQ(restored_prefix_length(block_manager, {0, 1, 2, 3, 4, 5, 6, 7, 80, 81, 82, 83, 9}, 76), 12u);
+    // Position 8 was forwarded with the rejected candidate 8 and its released block keeps that hash: the rejected
+    // chain is reusable up to there, by a request that really has those tokens, and no further.
+    EXPECT_EQ(restored_prefix_length(block_manager, {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 9}, 77), 9u);
+
+    block_manager.set_overwritten_block_observer(nullptr);
+    block_manager.free_sequence(sequence->get_id());
+}
+
+// Draft model order, rollback below the start of a block the candidates completed: that block is released, the
+// block before it loses its hash, and both positions are handed over again under the hashes of the accepted tokens.
+TEST(TestBlockManager, PublishingBeforeAndAfterARollbackBelowABlockHandsOverBothTokenChains) {
+    constexpr size_t block_size = 4;
+    ov::genai::BlockManager block_manager(8, true, block_size);
+    PublishedBlocksRecorder recorder;
+    block_manager.set_overwritten_block_observer(&recorder);
+
+    auto sequence_group = create_sequence_group(std::vector<int64_t>{0, 1, 2}, 78);
+    const auto sequence = sequence_group->get_running_sequences().front();
+    forward(block_manager, sequence_group, 3);
+    block_manager.publish_completed_blocks(sequence, 0, 3);
+    ASSERT_TRUE(recorder.published_hashes.empty()) << "the prompt does not fill a block";
+
+    append_tokens(sequence, {3, 4, 5, 6, 7});
+    forward(block_manager, sequence_group, 5);
+    block_manager.publish_completed_blocks(sequence, 3, 8);
+    append_tokens(sequence, {8});
+    const std::vector<size_t> rejected_hashes{sequence->get_hash(4, block_size), sequence->get_hash(8, block_size)};
+    ASSERT_EQ(recorder.published_hashes, rejected_hashes);
+
+    // Verdict: every candidate is removed, the main model's token 30 follows. The sequence then holds 4 tokens, 3 of them processed.
+    sequence->remove_last_tokens(6);
+    sequence->append_token(30, 0.0f);
+    sequence_group->update_processed_tokens_num(3);
+    block_manager.free_empty_physical_blocks(sequence_group);
+    ASSERT_EQ(block_manager.get_block_table(sequence->get_id(), 0).size(), 1u);
+    ASSERT_FALSE(block_manager.get_block_table(sequence->get_id(), 0).front()->has_published_hash());
+
+    append_tokens(sequence, {31, 32, 33, 34, 35});
+    forward(block_manager, sequence_group, 5);
+    block_manager.publish_completed_blocks(sequence, 3, 8);
+    const std::vector<size_t> accepted_hashes{sequence->get_hash(4, block_size), sequence->get_hash(8, block_size)};
+    ASSERT_EQ(recorder.published_hashes.size(), 4u);
+    EXPECT_EQ(std::vector<size_t>(recorder.published_hashes.begin() + 2, recorder.published_hashes.end()), accepted_hashes);
+    EXPECT_NE(accepted_hashes[0], rejected_hashes[0]);
+    EXPECT_NE(accepted_hashes[1], rejected_hashes[1]);
+    EXPECT_EQ(restored_prefix_length(block_manager, {0, 1, 2, 30, 31, 32, 33, 34, 9}, 79), 8u);
+
+    block_manager.set_overwritten_block_observer(nullptr);
+    block_manager.free_sequence(sequence->get_id());
+}
+
 TEST(TestBlockManager, PrefixCachingRollbackPreservesIdentityBackedBySharedOwner) {
     constexpr size_t block_size = 4;
     ov::genai::BlockManager block_manager(10, true, block_size);

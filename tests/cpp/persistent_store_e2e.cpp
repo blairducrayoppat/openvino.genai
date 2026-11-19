@@ -13,6 +13,7 @@
 
 #include "openvino/genai/continuous_batching_pipeline.hpp"
 #include "openvino/genai/generation_config.hpp"
+#include "openvino/genai/llm_pipeline.hpp"
 #include "store_plugin_locator.hpp"
 
 using namespace ov::genai;
@@ -26,6 +27,11 @@ constexpr const char* MODEL_PATH_ENV = "OFFLOAD_E2E_MODEL";
 // Points at a visual-language (hybrid KV + linear-attention) model directory. ContinuousBatchingPipeline can load such
 // a directory directly for plain text generation (it falls back to openvino_language_model.xml).
 constexpr const char* VLM_MODEL_PATH_ENV = "OFFLOAD_E2E_VLM_MODEL";
+
+// Points at an OpenVINO IR text-generation model with the tokenizer of OFFLOAD_E2E_MODEL, used as its draft model in
+// speculative decoding; the speculative decoding test is skipped when it is not provided. A draft model with the
+// weights and cache layout of the main model shares the main model's store namespace; any other draft gets its own.
+constexpr const char* DRAFT_MODEL_PATH_ENV = "OFFLOAD_E2E_DRAFT_MODEL";
 
 // Inference device for the comparison, defaults to CPU.
 constexpr const char* DEVICE_ENV = "OFFLOAD_E2E_DEVICE";
@@ -44,12 +50,15 @@ SchedulerConfig make_scheduler_config() {
     return config;
 }
 
-GenerationConfig make_greedy_config(size_t max_new_tokens) {
+GenerationConfig make_greedy_config(size_t max_new_tokens, size_t num_assistant_tokens = 0) {
     GenerationConfig config;
     config.max_new_tokens = max_new_tokens;
     config.do_sample = false;
     config.num_beams = 1;
     config.ignore_eos = true;
+    if (num_assistant_tokens > 0) {
+        config.num_assistant_tokens = num_assistant_tokens;
+    }
     return config;
 }
 
@@ -65,8 +74,9 @@ std::vector<int64_t> generate_ids(ContinuousBatchingPipeline& pipeline,
                                   uint64_t request_id,
                                   const std::string& prompt,
                                   size_t max_new_tokens,
-                                  size_t* prefix_cache_hit_tokens = nullptr) {
-    auto handle = pipeline.add_request(request_id, prompt, make_greedy_config(max_new_tokens));
+                                  size_t* prefix_cache_hit_tokens = nullptr,
+                                  size_t num_assistant_tokens = 0) {
+    auto handle = pipeline.add_request(request_id, prompt, make_greedy_config(max_new_tokens, num_assistant_tokens));
     while (pipeline.has_non_finished_requests()) {
         pipeline.step();
     }
@@ -176,6 +186,81 @@ void run_restart_reuses_stored_blocks(const std::string& model_path, const std::
     std::filesystem::remove_all(store_dir);
 }
 
+/// Block files the sample plugin's persistent provider keeps under `store_dir`, counted per namespace directory.
+std::vector<size_t> count_stored_blocks_per_namespace(const std::filesystem::path& store_dir) {
+    std::vector<size_t> counts;
+    for (const auto& ns_dir : std::filesystem::directory_iterator(store_dir)) {
+        if (!ns_dir.is_directory()) {
+            continue;
+        }
+        size_t blocks = 0;
+        for (const auto& entry : std::filesystem::directory_iterator(ns_dir.path())) {
+            blocks += entry.path().extension() == ".blk" ? 1 : 0;
+        }
+        counts.push_back(blocks);
+    }
+    return counts;
+}
+
+/// Speculative decoding runs a main and a draft pipeline, each with a store namespace of its own. Both leave their
+/// completed blocks in the persistent store, and a new pipeline pair that gets the same prompt reads them back.
+void run_speculative_decoding_restart_reuses_stored_blocks(const std::string& model_path,
+                                                           const std::string& draft_model_path,
+                                                           const std::string& plugin_path) {
+    const std::string prompt = repeat("The quick brown fox jumps over the lazy dog. ", 100);
+    constexpr size_t NEW_TOKENS = 24;
+    constexpr size_t NUM_ASSISTANT_TOKENS = 3;
+    const std::string device = e2e_device();
+    // The draft model is read again for every pipeline: constructing a pipeline transforms the model it is given.
+    const auto draft = [&] {
+        return ov::AnyMap{ov::genai::draft_model(draft_model_path, device)};
+    };
+
+    std::vector<int64_t> baseline_ids;
+    {
+        ContinuousBatchingPipeline pipeline(model_path, make_restart_scheduler_config(), device, draft());
+        baseline_ids = generate_ids(pipeline, /*request_id=*/70, prompt, NEW_TOKENS, nullptr, NUM_ASSISTANT_TOKENS);
+    }
+    ASSERT_EQ(baseline_ids.size(), NEW_TOKENS);
+
+    const auto store_dir = std::filesystem::temp_directory_path() / "openvino_genai_persistent_store_sd_e2e";
+    std::filesystem::remove_all(store_dir);
+    std::filesystem::create_directories(store_dir);
+    const auto config = make_persistent_store_config(plugin_path, store_dir.string(), /*hybrid=*/false);
+
+    {
+        ContinuousBatchingPipeline pipeline(model_path, config, device, draft());
+        size_t first_run_hit_tokens = 0;
+        EXPECT_EQ(generate_ids(pipeline, /*request_id=*/71, prompt, NEW_TOKENS, &first_run_hit_tokens, NUM_ASSISTANT_TOKENS),
+                  baseline_ids);
+        EXPECT_EQ(first_run_hit_tokens, 0u) << "nothing is stored yet, so the first run has nothing to reuse";
+    }  // the writing pipelines, and with them every in-memory cache, are gone
+
+    // One namespace per pipeline, or a single shared one if the draft has the main model's weights and cache layout.
+    const auto stored_blocks = count_stored_blocks_per_namespace(store_dir);
+    std::cout << "[ INFO     ] store namespaces after the writing pair: " << stored_blocks.size() << ", block files:";
+    for (const size_t blocks : stored_blocks) {
+        std::cout << ' ' << blocks;
+    }
+    std::cout << std::endl;
+    EXPECT_GE(stored_blocks.size(), 1u) << "no pipeline of the pair opened a store namespace";
+    EXPECT_LE(stored_blocks.size(), 2u);
+    for (const size_t blocks : stored_blocks) {
+        EXPECT_GT(blocks, 0u) << "a pipeline of the pair left no completed block in the store";
+    }
+
+    {
+        ContinuousBatchingPipeline pipeline(model_path, config, device, draft());
+        size_t restart_hit_tokens = 0;
+        EXPECT_EQ(generate_ids(pipeline, /*request_id=*/72, prompt, NEW_TOKENS, &restart_hit_tokens, NUM_ASSISTANT_TOKENS),
+                  baseline_ids)
+            << "reusing stored blocks in a new pipeline pair diverged from a run without a store";
+        std::cout << "[ INFO     ] main model prefix cache hit tokens after a restart: " << restart_hit_tokens << std::endl;
+        EXPECT_GT(restart_hit_tokens, 0u) << "the new main pipeline must read the stored blocks instead of recomputing them";
+    }
+    std::filesystem::remove_all(store_dir);
+}
+
 }  // namespace
 
 TEST(TestPersistentStoreEndToEnd, DiagnosticRepeatedPromptPrefixCacheHitMatchesColdRun) {
@@ -215,6 +300,20 @@ TEST(TestPersistentStoreEndToEnd, NewPipelineReusesBlocksStoredByAnEarlierOne) {
         GTEST_SKIP() << "samples/c/kv_cache_store_plugin was not built (requires -DENABLE_SAMPLES=ON)";
     }
     run_restart_reuses_stored_blocks(model_path, *plugin_path, /*hybrid=*/false);
+}
+
+TEST(TestPersistentStoreEndToEnd, SpeculativeDecodingNewPipelineReusesBlocksStoredByAnEarlierOne) {
+    const char* model_path = std::getenv(MODEL_PATH_ENV);
+    const char* draft_model_path = std::getenv(DRAFT_MODEL_PATH_ENV);
+    if (model_path == nullptr || *model_path == '\0' || draft_model_path == nullptr || *draft_model_path == '\0') {
+        GTEST_SKIP() << MODEL_PATH_ENV << " and " << DRAFT_MODEL_PATH_ENV
+                     << " are not both set, skipping speculative decoding persistent store end-to-end test.";
+    }
+    const auto plugin_path = find_sample_plugin_library();
+    if (!plugin_path.has_value()) {
+        GTEST_SKIP() << "samples/c/kv_cache_store_plugin was not built (requires -DENABLE_SAMPLES=ON)";
+    }
+    run_speculative_decoding_restart_reuses_stored_blocks(model_path, draft_model_path, *plugin_path);
 }
 
 TEST(TestPersistentStoreEndToEnd, HybridModelNewPipelineReusesBlocksStoredByAnEarlierOne) {
