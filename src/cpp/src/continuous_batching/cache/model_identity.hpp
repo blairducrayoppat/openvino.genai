@@ -35,10 +35,9 @@ namespace model_identity_detail {
  *
  * Node (friendly) names are never used (deliberately not visited here): OpenVINO auto-generates them from a
  * process-wide counter when not set explicitly, so they are not reproducible across processes. The tensor names of
- * the inputs and outputs are used: they are what the pipeline binds by, and they are empty unless the model sets
- * them, never generated. The bodies of
- * sub-graph operations (Loop, If, TensorIterator) are hashed recursively together with the descriptions that connect
- * them to the outer graph. An attribute of a type this class cannot hash is rejected instead of skipped, since
+ * the inputs and outputs are used, since they are what the pipeline binds by. The bodies of sub-graph operations
+ * (Loop, If, TensorIterator) are hashed recursively together with the descriptions that connect them to the outer
+ * graph. An attribute of a type this class cannot hash is rejected instead of skipped, since
  * skipping it would let two different models share one identity.
  */
 class ModelHasher final : public ov::AttributeVisitor {
@@ -82,7 +81,7 @@ public:
 
             // Interface: the tensor names an input is fed by and an output is read by. The pipeline binds both by
             // these names (model_runner.hpp), so two graphs that match node for node but swap the names of two
-            // inputs or two outputs compute different logits for the same request.
+            // inputs or two outputs can compute different logits for the same request.
             if (ov::is_type<ov::op::v0::Parameter>(op) || ov::is_type<ov::op::v0::Result>(op)) {
                 mix_tensor_names(op->output(0).get_names());
             }

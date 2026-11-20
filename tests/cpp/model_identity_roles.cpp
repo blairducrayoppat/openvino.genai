@@ -10,6 +10,7 @@
 #include <iterator>
 #include <memory>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "continuous_batching/cache/cache_offload_coordinator.hpp"
@@ -132,4 +133,35 @@ TEST(TestModelIdentityRoles, EachVariantOpensItsOwnStoreNamespace) {
     EXPECT_NE(straight, group_of(make_subtract_model(Wiring::NamesSwapped), "names_swapped"));
     EXPECT_NE(group_of(make_two_output_model(Wiring::Straight), "outputs_straight"),
               group_of(make_two_output_model(Wiring::NamesSwapped), "outputs_names_swapped"));
+}
+
+// One tensor with several names: the order the names were added in must not change the digest, the names must.
+// The sets are built from the same names in opposite orders, so that their iteration orders can differ.
+TEST(TestModelIdentityRoles, SeveralNamesOnOneTensorGiveTheSameDigestInAnyOrder) {
+    const std::vector<std::string> names = {"input_ids", "tokens", "ids_a", "ids_b", "ids_c", "ids_d", "ids_e", "ids_f"};
+    const auto with_names = [](const std::vector<std::string>& in_order) {
+        auto model = make_subtract_model(Wiring::Straight);
+        std::unordered_set<std::string> set;
+        for (const auto& name : in_order) {
+            set.insert(name);
+        }
+        model->get_parameters().at(0)->output(0).set_names(set);
+        return model;
+    };
+    const std::vector<std::string> reversed(names.rbegin(), names.rend());
+    std::vector<std::string> iteration_forward, iteration_reversed;
+    for (const auto& name : with_names(names)->get_parameters().at(0)->output(0).get_names()) {
+        iteration_forward.push_back(name);
+    }
+    for (const auto& name : with_names(reversed)->get_parameters().at(0)->output(0).get_names()) {
+        iteration_reversed.push_back(name);
+    }
+    std::cout << "RECORD several_names iteration_orders_differ " << (iteration_forward != iteration_reversed) << std::endl;
+
+    EXPECT_EQ(identity_of(with_names(names), "several_names_forward"),
+              identity_of(with_names(reversed), "several_names_reversed"));
+    std::vector<std::string> other = names;
+    other.back() = "ids_g";
+    EXPECT_NE(identity_of(with_names(names), "several_names_forward"), identity_of(with_names(other), "several_names_other"))
+        << "control";
 }
