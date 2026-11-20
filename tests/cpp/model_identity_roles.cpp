@@ -149,11 +149,14 @@ TEST(TestModelIdentityRoles, SeveralNamesOnOneTensorGiveTheSameDigestInAnyOrder)
         return model;
     };
     const std::vector<std::string> reversed(names.rbegin(), names.rend());
+    // The models are held by name: a range-for over a temporary model's names would outlive the model.
+    const auto forward_model = with_names(names);
+    const auto reversed_model = with_names(reversed);
     std::vector<std::string> iteration_forward, iteration_reversed;
-    for (const auto& name : with_names(names)->get_parameters().at(0)->output(0).get_names()) {
+    for (const auto& name : forward_model->get_parameters().at(0)->output(0).get_names()) {
         iteration_forward.push_back(name);
     }
-    for (const auto& name : with_names(reversed)->get_parameters().at(0)->output(0).get_names()) {
+    for (const auto& name : reversed_model->get_parameters().at(0)->output(0).get_names()) {
         iteration_reversed.push_back(name);
     }
     std::cout << "RECORD several_names iteration_orders_differ " << (iteration_forward != iteration_reversed) << std::endl;
