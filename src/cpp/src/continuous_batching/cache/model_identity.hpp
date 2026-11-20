@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <memory>
@@ -10,6 +11,7 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "content_hash.hpp"
@@ -19,6 +21,8 @@
 #include "openvino/core/node.hpp"
 #include "openvino/op/constant.hpp"
 #include "openvino/op/loop.hpp"
+#include "openvino/op/parameter.hpp"
+#include "openvino/op/result.hpp"
 #include "openvino/op/util/multi_subgraph_base.hpp"
 #include "openvino/op/util/variable.hpp"
 
@@ -29,8 +33,10 @@ namespace model_identity_detail {
 /**
  * @brief Feeds a graph into a ContentHash: every constant, and every operator's type, attributes and connectivity.
  *
- * Node/tensor names are never used (deliberately not visited here): OpenVINO auto-generates them from a
- * process-wide counter when not set explicitly, so they are not reproducible across processes. The bodies of
+ * Node (friendly) names are never used (deliberately not visited here): OpenVINO auto-generates them from a
+ * process-wide counter when not set explicitly, so they are not reproducible across processes. The tensor names of
+ * the inputs and outputs are used: they are what the pipeline binds by, and they are empty unless the model sets
+ * them, never generated. The bodies of
  * sub-graph operations (Loop, If, TensorIterator) are hashed recursively together with the descriptions that connect
  * them to the outer graph. An attribute of a type this class cannot hash is rejected instead of skipped, since
  * skipping it would let two different models share one identity.
@@ -72,6 +78,13 @@ public:
             mix_bytes(type_name, std::strlen(type_name));
             if (version_id != nullptr) {
                 mix_bytes(version_id, std::strlen(version_id));
+            }
+
+            // Interface: the tensor names an input is fed by and an output is read by. The pipeline binds both by
+            // these names (model_runner.hpp), so two graphs that match node for node but swap the names of two
+            // inputs or two outputs compute different logits for the same request.
+            if (ov::is_type<ov::op::v0::Parameter>(op) || ov::is_type<ov::op::v0::Result>(op)) {
+                mix_tensor_names(op->output(0).get_names());
             }
 
             // Connectivity: which op (by position in topological order, never by name) feeds which input.
@@ -245,6 +258,18 @@ private:
     void mix_name(const std::string& name) {
         mix_bytes(name.data(), name.size());
     }
+    /// Sorted, each with its length, since the set itself has no order and the boundaries between names count.
+    void mix_tensor_names(const std::unordered_set<std::string>& names) {
+        std::vector<std::string> sorted(names.begin(), names.end());
+        std::sort(sorted.begin(), sorted.end());
+        const size_t count = sorted.size();
+        mix_bytes(&count, sizeof(count));
+        for (const std::string& name : sorted) {
+            const size_t size = name.size();
+            mix_bytes(&size, sizeof(size));
+            mix_bytes(name.data(), size);
+        }
+    }
     template <typename T>
     void mix_text(const T& streamable) {
         std::ostringstream description;
@@ -280,9 +305,10 @@ private:
  * Block hashes of the prefix cache depend only on tokens, so a store that outlives the pipeline needs
  * something that tells two models apart. The digest covers every constant's element type, shape and bytes
  * (in graph order), plus every operator's type, attributes and connectivity (by position in topological
- * order, never by name - see ModelHasher), so the same weights and graph give the same value
- * across processes and builds, and two graphs that happen to share constants but differ in operators,
- * attributes, wiring or sub-graph bodies do not collide.
+ * order, never by node name - see ModelHasher), plus the tensor names of the inputs and outputs, so the same
+ * weights and graph give the same value across processes and builds, and two graphs that happen to share
+ * constants but differ in operators, attributes, wiring, sub-graph bodies or which named input or output plays
+ * which role do not collide.
  * @throws ov::Exception if an operator has an attribute of a type the digest cannot cover.
  */
 inline std::string compute_model_identity(const std::shared_ptr<const ov::Model>& model) {
