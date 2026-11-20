@@ -32,8 +32,10 @@
 #include "continuous_batching/cache/kv_cache_offload_cache.hpp"
 #include "continuous_batching/cache/linear_attention_cache_manager.hpp"
 #include "continuous_batching/cache/linear_attention_offload_cache.hpp"
+#include "continuous_batching/cache/model_identity.hpp"
 #include "continuous_batching/cache/store_registry.hpp"
 #include "helper.hpp"
+#include "model_identity_test_models.hpp"
 #include "openvino/genai/scheduler_config.hpp"
 #include "openvino/runtime/core.hpp"
 #include "prefix_digest_registry.hpp"
@@ -936,4 +938,54 @@ TEST(TestPersistentFileKVCacheStore, StoreGroupsOfDifferentModelIdentitiesAreDif
     EXPECT_TRUE(draft_store->outlives_process()) << "a different identity must not share the main model's directory";
     auto same_store = open_kv_cache_store(layout, config, "CPU", main_group);
     EXPECT_FALSE(same_store->outlives_process()) << "the same identity and layout name the locked directory";
+}
+
+// End to end at unit level: a block written by one model is found again by the same model after a restart, never by
+// a model whose two inputs swap roles (model_identity_test_models.hpp), which computes different logits from the
+// same tokens. The namespace comes from compute_model_identity() and group_name(), as in the pipeline.
+TEST(TestPersistentFileKVCacheStore, ModelWithSwappedInputRolesDoesNotRestoreTheOtherModelsBlocks) {
+    using namespace model_identity_test_models;
+    ScopedDirectory directory("openvino_genai_gap2_identity_roles");
+    const auto layout = make_layout();
+    const auto config = make_persistent_config(directory.path);
+    const auto group_of = [&](const std::shared_ptr<ov::Model>& model) {
+        return CacheOffloadCoordinator(compute_model_identity(model)).group_name("kv", layout, /*block_tokens=*/4, "CPU");
+    };
+    const std::string writer_group = group_of(make_subtract_model(Wiring::Straight));
+    const std::string same_model_group = group_of(make_subtract_model(Wiring::Straight));
+    const std::string other_operator_group =
+        group_of(make_subtract_model(Wiring::Straight, ov::PartialShape{1, 4}, /*use_add=*/true));
+    const std::string swapped_group = group_of(make_subtract_model(Wiring::Swapped));
+    const PrefixKey key = key_of(7, 0x7777);
+    {
+        auto store = open_kv_cache_store(layout, config, "CPU", writer_group);
+        ASSERT_TRUE(store->outlives_process());
+        write_keyed(*store, key, make_block(7));
+        store->flush();
+    }
+    {
+        // Control before: the same model, rebuilt, restores its own block.
+        auto store = open_kv_cache_store(layout, config, "CPU", same_model_group);
+        ASSERT_TRUE(store->outlives_process());
+        ASSERT_EQ(read_keyed(*store, key), make_block(7)) << "control: the same model did not find its block";
+    }
+    {
+        // Control: a model with another operator misses.
+        auto store = open_kv_cache_store(layout, config, "CPU", other_operator_group);
+        ASSERT_TRUE(store->outlives_process());
+        EXPECT_FALSE(has_keyed(*store, key)) << "control: a different operator found the block";
+    }
+    {
+        auto store = open_kv_cache_store(layout, config, "CPU", swapped_group);
+        ASSERT_TRUE(store->outlives_process());
+        EXPECT_FALSE(has_keyed(*store, key)) << "the model with swapped input roles found the other model's block";
+        EXPECT_NE(read_keyed(*store, key), std::optional<std::vector<uint8_t>>(make_block(7)))
+            << "the model with swapped input roles restored the other model's bytes";
+    }
+    {
+        // Control after: the writer's block is still there.
+        auto store = open_kv_cache_store(layout, config, "CPU", same_model_group);
+        ASSERT_TRUE(store->outlives_process());
+        EXPECT_EQ(read_keyed(*store, key), make_block(7)) << "control after: the same model did not find its block";
+    }
 }
