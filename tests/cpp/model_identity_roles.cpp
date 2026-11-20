@@ -17,6 +17,8 @@
 #include "continuous_batching/cache/kv_cache_disk_layout.hpp"
 #include "continuous_batching/cache/model_identity.hpp"
 #include "model_identity_test_models.hpp"
+#include "openvino/op/constant.hpp"
+#include "openvino/op/loop.hpp"
 #include "openvino/runtime/core.hpp"
 
 using namespace ov::genai;
@@ -149,7 +151,8 @@ TEST(TestModelIdentityRoles, SeveralNamesOnOneTensorGiveTheSameDigestInAnyOrder)
         return model;
     };
     const std::vector<std::string> reversed(names.rbegin(), names.rend());
-    // The models are held by name: a range-for over a temporary model's names would outlive the model.
+    // The models are held in variables: a range-for over the names of a temporary model would read them after the
+    // model is destroyed.
     const auto forward_model = with_names(names);
     const auto reversed_model = with_names(reversed);
     std::vector<std::string> iteration_forward, iteration_reversed;
@@ -159,12 +162,50 @@ TEST(TestModelIdentityRoles, SeveralNamesOnOneTensorGiveTheSameDigestInAnyOrder)
     for (const auto& name : reversed_model->get_parameters().at(0)->output(0).get_names()) {
         iteration_reversed.push_back(name);
     }
-    std::cout << "RECORD several_names iteration_orders_differ " << (iteration_forward != iteration_reversed) << std::endl;
+    const bool orders_differ = iteration_forward != iteration_reversed;
+    std::cout << "RECORD several_names iteration_orders_differ " << orders_differ << std::endl;
 
-    EXPECT_EQ(identity_of(with_names(names), "several_names_forward"),
-              identity_of(with_names(reversed), "several_names_reversed"));
+    EXPECT_EQ(identity_of(forward_model, "several_names_forward"), identity_of(reversed_model, "several_names_reversed"));
     std::vector<std::string> other = names;
     other.back() = "ids_g";
-    EXPECT_NE(identity_of(with_names(names), "several_names_forward"), identity_of(with_names(other), "several_names_other"))
+    EXPECT_NE(identity_of(forward_model, "several_names_forward"), identity_of(with_names(other), "several_names_other"))
         << "control";
+    if (!orders_differ) {
+        // Both sets iterate alike on this standard library, so the digest would agree without the sort as well.
+        GTEST_SKIP() << "the two name sets iterate in the same order here; the order independence is not exercised";
+    }
+}
+
+/// A Loop whose body subtracts its second parameter from its first; @p swap_body_names exchanges the tensor names of
+/// the two body parameters, which nothing outside the body binds by.
+static std::shared_ptr<ov::Model> make_named_loop_model(bool swap_body_names) {
+    auto carried = named_parameter(ov::element::f32, ov::PartialShape{1, 4}, "carried");
+    auto step = named_parameter(ov::element::f32, ov::PartialShape{1, 4}, "step");
+    auto trip_count = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{}, {3});
+    auto condition = ov::op::v0::Constant::create(ov::element::boolean, ov::Shape{}, {true});
+    auto body_first = named_parameter(ov::element::f32, ov::PartialShape{1, 4}, swap_body_names ? "body_b" : "body_a");
+    auto body_second = named_parameter(ov::element::f32, ov::PartialShape{1, 4}, swap_body_names ? "body_a" : "body_b");
+    auto body_value = std::make_shared<ov::op::v1::Subtract>(body_first, body_second);
+    auto body_result = std::make_shared<ov::op::v0::Result>(body_value);
+    auto condition_result = std::make_shared<ov::op::v0::Result>(
+        ov::op::v0::Constant::create(ov::element::boolean, ov::Shape{}, {true}));
+    auto body = std::make_shared<ov::Model>(ov::ResultVector{body_result, condition_result},
+                                            ov::ParameterVector{body_first, body_second});
+    auto loop = std::make_shared<ov::op::v5::Loop>(trip_count, condition);
+    loop->set_function(body);
+    loop->set_special_body_ports({-1, 1});
+    loop->set_merged_input(body_first, carried, body_result);
+    loop->set_invariant_input(body_second, step);
+    auto output = loop->get_iter_value(body_result, -1);
+    output.set_names({"logits"});
+    auto result = std::make_shared<ov::op::v0::Result>(output);
+    return std::make_shared<ov::Model>(ov::ResultVector{result}, ov::ParameterVector{carried, step});
+}
+
+// Sub-graph bodies are hashed recursively, names of body parameters and results included: the same Loop gives one
+// digest, and exchanging two body parameter names alone gives another (a separate namespace, never a shared one).
+TEST(TestModelIdentityRoles, NamesInsideALoopBodyAreHashed) {
+    EXPECT_EQ(identity_of(make_named_loop_model(false), "loop_a"), identity_of(make_named_loop_model(false), "loop_b"));
+    EXPECT_NE(identity_of(make_named_loop_model(false), "loop_a"),
+              identity_of(make_named_loop_model(true), "loop_body_names_swapped"));
 }

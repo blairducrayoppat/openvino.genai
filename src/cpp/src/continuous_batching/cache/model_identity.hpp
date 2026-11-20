@@ -81,7 +81,9 @@ public:
 
             // Interface: the tensor names an input is fed by and an output is read by. The pipeline binds both by
             // these names (model_runner.hpp), so two graphs that match node for node but swap the names of two
-            // inputs or two outputs can compute different logits for the same request.
+            // inputs or two outputs can compute different logits for the same request. hash_model() also runs on
+            // sub-graph bodies, so the names of body parameters and results are hashed as well; nothing binds by
+            // them, and a difference there only gives another namespace.
             if (ov::is_type<ov::op::v0::Parameter>(op) || ov::is_type<ov::op::v0::Result>(op)) {
                 mix_tensor_names(op->output(0).get_names());
             }
