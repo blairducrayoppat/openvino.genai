@@ -23,6 +23,7 @@
 #include "continuous_batching/cache/abi_sdk_fingerprint.hpp"
 #include "continuous_batching/cache/file_kv_cache_store.hpp"
 #include "continuous_batching/cache/kv_cache_offload_manager.hpp"
+#include "continuous_batching/cache/persistent_file_kv_cache_store.hpp"
 #include "content_hash.hpp"
 #include "logger.hpp"
 #include "openvino/genai/c/kv_cache_store_provider_abi.h"
@@ -111,7 +112,15 @@ std::unique_ptr<IKVCacheStore> make_default_store(const KVCacheDiskLayout& layou
                                                   const CacheOffloadConfig& config,
                                                   const std::string& device,
                                                   const std::string& group) {
-    (void)group;
+    if (config.persist_file_store) {
+        try {
+            return std::make_unique<PersistentFileKVCacheStore>(layout, config, device, group);
+        } catch (const std::exception& error) {
+            GENAI_WARN("Cannot open the persistent file store for group '%s', using a run-scoped one: %s",
+                       group.c_str(),
+                       error.what());
+        }
+    }
     auto backend = std::make_unique<KVCacheOffloadManager>(layout, config, device);
     return std::make_unique<FileKVCacheStore>(std::move(backend));
 }

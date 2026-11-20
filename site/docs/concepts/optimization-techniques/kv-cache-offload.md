@@ -48,12 +48,24 @@ The size of the store is set with `capacity_bytes`, or with `ssd_cache_capacity_
 
 The default store is a file that belongs to one pipeline instance: it is created with the pipeline and removed with it. Out of the box, offload therefore only helps within one run, when a block has been evicted from device memory and the same prefix comes back. It does not carry over to the next process.
 
-Reuse across processes, for example after a restart, needs two more settings:
+Reuse across processes, for example after a restart, needs a persistent store, which is one of the first two settings below, and `store_completed_blocks=True`:
 
+* A **persistent store**. Either the in-tree file store with `persist_file_store=True` and an explicit `kv_cache_dir`, which keeps its blocks in `kv_cache_dir/ov_genai_kv_store/` after the pipeline is destroyed, or a store plugin. The persistent file store checks every block it reads against a checksum, so a block left half-written by a crash is recomputed rather than used, and only one process at a time uses its directory: another process opening it meanwhile gets a run-scoped store. `reuse_ssd_cache=False` empties it when it is opened. It holds `capacity_bytes` worth of blocks; each block takes a 4 KiB-aligned slot with a 64-byte header, so the file is somewhat larger than `capacity_bytes` (much larger for very small blocks). The file is sized without being written, so disk space is taken as blocks are stored; when it is full, the oldest stored block makes room. Opening it with another `capacity_bytes`, or with a build whose file format or hash algorithm differs, empties it as well (a warning names the store). It stores a block only under the 128-bit prefix digest that the pipeline records while hashing a prompt, and does not store a block whose digest is unknown. Draft-model blocks of MTP speculative decoding, and of Eagle3 speculative decoding with embeddings input, are hashed through the main model's sequence, which records that digest, so they are stored under the main model's digest of the prefix one token longer.
 * A **persistent store plugin** that keeps its blocks beyond the process, set with `store_library_path` and `allow_untrusted_store_plugin=True`. The plugin implements the C ABI declared in [kv_cache_store_provider_abi.h](../../../../src/cpp/include/openvino/genai/c/kv_cache_store_provider_abi.h); [samples/c/kv_cache_store_plugin](../../../../samples/c/kv_cache_store_plugin/sample_kv_cache_store_plugin.c) is a reference implementation. A plugin that cannot be loaded is reported in the log, and the pipeline falls back to the default store. `reuse_ssd_cache` tells the plugin whether to keep what an earlier run left in `kv_cache_dir`.
 * `store_completed_blocks=True`, which stores every block right after the forward pass that completed it instead of only when it is about to be overwritten. Without it, a block that was never evicted is not in the store when the process ends.
 
 Blocks are stored under a name derived from the model, the device and the cache layout, so a store written for another model or device is not reused.
+
+```python
+scheduler_config.cache_offload_config = ov_genai.CacheOffloadConfig(
+    kv_cache_dir="/mnt/ssd/kv_cache",
+    capacity_bytes=16 * 1024 * 1024 * 1024,
+    persist_file_store=True,
+    store_completed_blocks=True,
+)
+```
+
+or, with a plugin:
 
 ```python
 scheduler_config.cache_offload_config = ov_genai.CacheOffloadConfig(
