@@ -853,7 +853,8 @@ void hash_draft_through_main(const Sequence::Ptr& draft, const Sequence::Ptr& ma
 // A draft sequence hashed through the main sequence, as speculative decoding with MTP or Eagle3 (embeddings input)
 // does, gets no digest of its own; the main sequence's get_hash records one for the hash it returns. This checks that
 // the draft's offload tier finds that digest, so the persistent store keeps the draft block under it, and that a
-// later tier restores it once the main sequence of the new run has hashed the same prompt.
+// second tier opened later in the same process restores it from the reopened store. The process-wide digest registry
+// is not emptied in between, so this does not show a restore across a process restart.
 TEST(TestPersistentFileKVCacheStore, DraftBlockHashedThroughTheMainSequenceIsKeptUnderTheMainDigest) {
     ScopedDirectory directory("openvino_genai_gap2_draft_identity");
     ov::Core core;
@@ -896,7 +897,8 @@ TEST(TestPersistentFileKVCacheStore, DraftBlockHashedThroughTheMainSequenceIsKep
     fixture.fill_block(1, /*seed=*/0);
     fixture.fill_block(2, /*seed=*/0);
 
-    // A later run: new sequences for the same prompt; the main digest is a function of the tokens alone.
+    // Later in the same process: new sequences for the same prompt and a second tier over the same directory. The
+    // registry still holds the digest recorded above; the main digest is a function of the tokens alone.
     auto main_group = make_sequence_group(main_tokens, 9103);
     auto draft_group = make_sequence_group(draft_tokens, 9104);
     const Sequence::Ptr main = main_group->get_sequences().front();
