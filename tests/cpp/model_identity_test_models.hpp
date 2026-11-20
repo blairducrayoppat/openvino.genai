@@ -6,6 +6,7 @@
 
 #include <memory>
 #include <string>
+#include <utility>
 
 #include "openvino/core/model.hpp"
 #include "openvino/op/add.hpp"
@@ -20,10 +21,13 @@
 namespace model_identity_test_models {
 
 enum class Wiring {
-    // input_ids feeds the first input of the operation, position_ids the second.
+    // The first parameter is input_ids and feeds the first port, the second is position_ids and feeds the second.
     Straight,
-    // The same two inputs feed the other ports: same graph shape, the inputs swap roles.
-    Swapped,
+    // The same parameters feed the other ports: the wiring differs, the names stay with their parameters.
+    Rewired,
+    // The same parameters feed the same ports, but the two names are exchanged: node for node and edge for edge the
+    // graph is the Straight one, yet input_ids and position_ids swap roles.
+    NamesSwapped,
 };
 
 inline std::shared_ptr<ov::op::v0::Parameter> named_parameter(const ov::element::Type& type,
@@ -35,14 +39,24 @@ inline std::shared_ptr<ov::op::v0::Parameter> named_parameter(const ov::element:
     return parameter;
 }
 
-/// logits = input_ids - position_ids (Straight) or position_ids - input_ids (Swapped); both inputs share @p shape.
+/// Names of the first and second parameter.
+inline std::pair<std::string, std::string> parameter_names(Wiring wiring) {
+    if (wiring == Wiring::NamesSwapped) {
+        return {"position_ids", "input_ids"};
+    }
+    return {"input_ids", "position_ids"};
+}
+
+/// logits = first - second (Straight, NamesSwapped) or second - first (Rewired); both inputs share @p shape.
+/// Straight computes input_ids - position_ids; Rewired and NamesSwapped compute position_ids - input_ids.
 inline std::shared_ptr<ov::Model> make_subtract_model(Wiring wiring,
                                                       const ov::PartialShape& shape = ov::PartialShape{1, 4},
                                                       bool use_add = false) {
-    auto input_ids = named_parameter(ov::element::i64, shape, "input_ids");
-    auto position_ids = named_parameter(ov::element::i64, shape, "position_ids");
-    const ov::Output<ov::Node> lhs = wiring == Wiring::Straight ? input_ids->output(0) : position_ids->output(0);
-    const ov::Output<ov::Node> rhs = wiring == Wiring::Straight ? position_ids->output(0) : input_ids->output(0);
+    const auto names = parameter_names(wiring);
+    auto first = named_parameter(ov::element::i64, shape, names.first);
+    auto second = named_parameter(ov::element::i64, shape, names.second);
+    const ov::Output<ov::Node> lhs = wiring == Wiring::Rewired ? second->output(0) : first->output(0);
+    const ov::Output<ov::Node> rhs = wiring == Wiring::Rewired ? first->output(0) : second->output(0);
     std::shared_ptr<ov::Node> op;
     if (use_add) {
         op = std::make_shared<ov::op::v1::Add>(lhs, rhs);
@@ -53,34 +67,36 @@ inline std::shared_ptr<ov::Model> make_subtract_model(Wiring wiring,
     op->output(0).set_names({"logits"});
     auto result = std::make_shared<ov::op::v0::Result>(op);
     result->set_friendly_name("logits");
-    return std::make_shared<ov::Model>(ov::ResultVector{result}, ov::ParameterVector{input_ids, position_ids});
+    return std::make_shared<ov::Model>(ov::ResultVector{result}, ov::ParameterVector{first, second});
 }
 
-/// logits = concat(input_ids [1,4], position_ids [1,3]) along axis 1, in that order (Straight) or the other (Swapped).
-/// The two inputs differ in shape, so the graph itself records which one comes first.
+/// logits = concat(first [1,4], second [1,3]) along axis 1 (Straight, NamesSwapped) or concat(second, first)
+/// (Rewired). The two inputs differ in shape.
 inline std::shared_ptr<ov::Model> make_concat_model(Wiring wiring) {
-    auto input_ids = named_parameter(ov::element::i64, ov::PartialShape{1, 4}, "input_ids");
-    auto position_ids = named_parameter(ov::element::i64, ov::PartialShape{1, 3}, "position_ids");
-    ov::OutputVector parts = {input_ids, position_ids};
-    if (wiring == Wiring::Swapped) {
-        parts = {position_ids, input_ids};
+    const auto names = parameter_names(wiring);
+    auto first = named_parameter(ov::element::i64, ov::PartialShape{1, 4}, names.first);
+    auto second = named_parameter(ov::element::i64, ov::PartialShape{1, 3}, names.second);
+    ov::OutputVector parts = {first, second};
+    if (wiring == Wiring::Rewired) {
+        parts = {second, first};
     }
     auto concat = std::make_shared<ov::op::v0::Concat>(parts, 1);
     concat->set_friendly_name("op");
     concat->output(0).set_names({"logits"});
     auto result = std::make_shared<ov::op::v0::Result>(concat);
     result->set_friendly_name("logits");
-    return std::make_shared<ov::Model>(ov::ResultVector{result}, ov::ParameterVector{input_ids, position_ids});
+    return std::make_shared<ov::Model>(ov::ResultVector{result}, ov::ParameterVector{first, second});
 }
 
-/// Two outputs over the same inputs: "logits" = a + b and "other" = a - b (Straight), or the names swapped (Swapped).
+/// Two outputs over the same inputs: "logits" = a + b and "other" = a - b (Straight), or the two output names
+/// exchanged (NamesSwapped).
 inline std::shared_ptr<ov::Model> make_two_output_model(Wiring wiring) {
     auto a = named_parameter(ov::element::i64, ov::PartialShape{1, 4}, "input_ids");
     auto b = named_parameter(ov::element::i64, ov::PartialShape{1, 4}, "position_ids");
     auto add = std::make_shared<ov::op::v1::Add>(a, b);
     auto subtract = std::make_shared<ov::op::v1::Subtract>(a, b);
-    add->output(0).set_names({wiring == Wiring::Straight ? "logits" : "other"});
-    subtract->output(0).set_names({wiring == Wiring::Straight ? "other" : "logits"});
+    add->output(0).set_names({wiring == Wiring::NamesSwapped ? "other" : "logits"});
+    subtract->output(0).set_names({wiring == Wiring::NamesSwapped ? "logits" : "other"});
     auto add_result = std::make_shared<ov::op::v0::Result>(add);
     auto subtract_result = std::make_shared<ov::op::v0::Result>(subtract);
     return std::make_shared<ov::Model>(ov::ResultVector{add_result, subtract_result}, ov::ParameterVector{a, b});
